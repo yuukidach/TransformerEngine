@@ -2677,8 +2677,17 @@ def blockwise_gemm_sm100(
 
 
 num_streams = tex.get_num_cublas_streams()
-streams = [torch.cuda.Stream() for _ in range(num_streams)]
-events = [torch.cuda.Event() for _ in range(num_streams)]
+_device_streams: dict[int, list[torch.cuda.Stream]] = {}
+_device_events: dict[int, list[torch.cuda.Event]] = {}
+
+
+def _get_streams_and_events(device: int):
+    """Get device-specific streams and events, creating them if necessary."""
+    if device not in _device_streams:
+        with torch.cuda.device(device):
+            _device_streams[device] = [torch.cuda.Stream() for _ in range(num_streams)]
+            _device_events[device] = [torch.cuda.Event() for _ in range(num_streams)]
+    return _device_streams[device], _device_events[device]
 
 
 def blockwise_grouped_gemm_sm100(
@@ -2704,9 +2713,13 @@ def blockwise_grouped_gemm_sm100(
         out = torch.split(out[0], m_splits)
     assert len(out) == num_gemms
 
+    # Get device-specific streams and events
+    current_stream = torch.cuda.current_stream()
+    device = current_stream.device.index
+    streams, events = _get_streams_and_events(device)
+
     num_stream_used = min(num_streams, num_gemms)
     # wait for current stream to finish
-    current_stream = torch.cuda.current_stream()
     events[0].record(current_stream)
     for s in range(num_stream_used):
         streams[s].wait_event(events[0])
