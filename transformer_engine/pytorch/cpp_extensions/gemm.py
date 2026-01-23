@@ -7,6 +7,7 @@
 from typing import Iterable, Optional, Tuple, Union, List
 import os
 import functools
+from operator import mul
 import torch
 import transformer_engine_torch as tex
 from ..constants import TE_DType
@@ -18,7 +19,7 @@ from ..tensor.utils import is_custom
 from ..custom_recipes.gemm import custom_gemm
 from ...debug.pytorch.debug_quantization import DebugQuantizer
 from ..quantization import FP8GlobalStateManager
-from .blockwise_gemm_sm100 import blockwise_grouped_gemm_sm100
+from .blockwise_gemm_sm100 import blockwise_gemm_sm100, blockwise_grouped_gemm_sm100
 
 __all__ = [
     "general_gemm",
@@ -175,6 +176,36 @@ def general_gemm(
             or B._data_format != tex.Float8BlockScaleTensorFormat.GEMM_READY
         ):
             raise RuntimeError("GEMM with Float8BlockwiseQTensor requires GEMM_READY format")
+
+    if (
+        isinstance(A, Float8BlockwiseQTensorStorage)
+        and getattr(FP8GlobalStateManager.get_fp8_recipe(), "use_f32_scales", False)
+        and get_device_compute_capability() >= (10, 0)
+    ):
+        out_dtype = out_dtype or torch.bfloat16
+        B_shape_original = B.size()
+        k = A.size(-1)
+        n = functools.reduce(mul, A.size()) // k
+        m = functools.reduce(mul, B.size()) // k
+        if out is None:
+            # Use size() method which works for both Tensor and Float8BlockwiseQTensorStorage
+            a_device = (
+                A._rowwise_data.device if A._rowwise_data is not None else A._columnwise_data.device
+            )
+            out = torch.empty(m, n, device=a_device, dtype=out_dtype)
+        blockwise_gemm_sm100(
+            B,
+            transb,
+            A,
+            transa,
+            out,
+            TE_DType[out_dtype],
+            grad,  # is_dw: indicates backward pass
+            accumulate,
+            torch.cuda.current_stream(),
+        )
+        out = out.view(*B_shape_original[:-1], n)
+        return out, None, None, extra_output
 
     args = (
         A,
