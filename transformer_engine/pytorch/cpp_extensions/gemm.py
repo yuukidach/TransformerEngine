@@ -179,7 +179,7 @@ def general_gemm(
 
     if (
         isinstance(A, Float8BlockwiseQTensorStorage)
-        and getattr(FP8GlobalStateManager.get_fp8_recipe(), "use_f32_scales", False)
+        and os.getenv("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", "0") == "1"
         and get_device_compute_capability() >= (10, 0)
     ):
         out_dtype = out_dtype or torch.bfloat16
@@ -200,7 +200,7 @@ def general_gemm(
             transa,
             out,
             TE_DType[out_dtype],
-            grad,  # is_dw: indicates backward pass
+            grad and transb and not transa,  # is_dw: True only for wgrad (NT layout)
             accumulate,
             torch.cuda.current_stream(),
         )
@@ -327,7 +327,7 @@ def general_grouped_gemm(
 
     if (
         isinstance(A[0], Float8BlockwiseQTensorStorage)
-        and getattr(FP8GlobalStateManager.get_fp8_recipe(), "use_f32_scales", False)
+        and os.getenv("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", "0") == "1"
         and get_device_compute_capability() >= (10, 0)
     ):
         assert not gelu, "GELU not supported in FP8 blockwise gemm with f32 scales."
