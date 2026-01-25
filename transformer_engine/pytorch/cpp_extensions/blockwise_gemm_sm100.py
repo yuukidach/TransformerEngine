@@ -2569,16 +2569,12 @@ def blockwise_gemm_sm100(
         b_data = b._columnwise_data
         b_scale_inv = b._columnwise_scale_inv
 
-    if a_data.dim() > 2:
-        a_data = a_data.view(-1, a_data.shape[-1])
-    if b_data.dim() > 2:
-        b_data = b_data.view(-1, b_data.shape[-1])
-
     m = a_data.shape[0]
     k = a_data.shape[1]
     n = b_data.shape[0]
-    assert k == b_data.shape[1]
-    assert out.shape == (m, n)
+
+    assert k == b_data.shape[1], f"{k=}, {b_data.shape=}"
+    assert out.shape == (m, n), f"out.shape: {out.shape}, expected: {(m, n)}"
 
     ab_dtype = cutlass.Float8E4M3FN
     acc_dtype = cutlass.Float32

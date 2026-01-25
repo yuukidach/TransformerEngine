@@ -183,12 +183,14 @@ def general_gemm(
         and get_device_compute_capability() >= (10, 0)
     ):
         out_dtype = out_dtype or torch.bfloat16
-        B_shape_original = B.size()
-        k = A.size(-1)
-        n = functools.reduce(mul, A.size()) // k
-        m = functools.reduce(mul, B.size()) // k
+        # Get m, n from tensor sizes (expects 2D inputs after reshape)
+        # A: [m, k] or [k, m] depending on transa
+        # B: [k, n] or [n, k] depending on transb
+        A_size = A.size()
+        B_size = B.size()
+        n = A_size[0] if transa else A_size[1]
+        m = B_size[1] if transb else B_size[0]
         if out is None:
-            # Use size() method which works for both Tensor and Float8BlockwiseQTensorStorage
             a_device = (
                 A._rowwise_data.device if A._rowwise_data is not None else A._columnwise_data.device
             )
@@ -204,7 +206,6 @@ def general_gemm(
             accumulate,
             torch.cuda.current_stream(),
         )
-        out = out.view(*B_shape_original[:-1], n)
         return out, None, None, extra_output
 
     args = (
