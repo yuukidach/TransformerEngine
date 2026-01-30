@@ -486,11 +486,6 @@ void quantize_transpose_square_blockwise(const SimpleTensor& input, SimpleTensor
   NVTE_API_CALL(quantize_transpose_square_blockwise);
   checkCuDriverContext(stream);
 
-  if (transformer_engine::cuda::sm_arch() >= 100) {
-    NVTE_CHECK(pow_2_scale, "On Blackwell and newer, the FP8 block scaling recipe is emulated ",
-               "with MXFP8, which requires using power of two scaling factors.");
-  }
-
   NVTE_CHECK(input.shape == output.shape, "Input and output must have the same shape.");
   const size_t row_length = input.shape.size() > 0 ? input.shape.back() : 1;
   size_t num_rows = 1;

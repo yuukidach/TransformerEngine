@@ -7,17 +7,19 @@
 from typing import Iterable, Optional, Tuple, Union, List
 import os
 import functools
+from operator import mul
 import torch
 import transformer_engine_torch as tex
 from ..constants import TE_DType
-from ..utils import get_sm_count, _empty_tensor
+from ..utils import get_sm_count, _empty_tensor, get_device_compute_capability
 
 from ..quantized_tensor import Quantizer
 from ..tensor.storage.float8_blockwise_tensor_storage import Float8BlockwiseQTensorStorage
 from ..tensor.utils import is_custom
 from ..custom_recipes.gemm import custom_gemm
 from ...debug.pytorch.debug_quantization import DebugQuantizer
-
+from ..quantization import FP8GlobalStateManager
+from .blockwise_gemm_sm100 import blockwise_gemm_sm100, blockwise_grouped_gemm_sm100
 
 __all__ = [
     "general_gemm",
@@ -167,6 +169,37 @@ def general_gemm(
         # FP8 block-scaling requires split accumulator
         use_split_accumulator = True
 
+    if (
+        isinstance(A, Float8BlockwiseQTensorStorage)
+        and os.getenv("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", "0") == "1"
+        and get_device_compute_capability() >= (10, 0)
+    ):
+        out_dtype = out_dtype or torch.bfloat16
+        # Get m, n from tensor sizes (expects 2D inputs after reshape)
+        # A: [m, k] or [k, m] depending on transa
+        # B: [k, n] or [n, k] depending on transb
+        A_size = A.size()
+        B_size = B.size()
+        n = A_size[0] if transa else A_size[1]
+        m = B_size[1] if transb else B_size[0]
+        if out is None:
+            a_device = (
+                A._rowwise_data.device if A._rowwise_data is not None else A._columnwise_data.device
+            )
+            out = torch.empty(m, n, device=a_device, dtype=out_dtype)
+        blockwise_gemm_sm100(
+            B,
+            transb,
+            A,
+            transa,
+            out,
+            TE_DType[out_dtype],
+            grad and transb and not transa,  # is_dw: True only for wgrad (NT layout)
+            accumulate,
+            torch.cuda.current_stream(),
+        )
+        return out, None, None, extra_output
+
     args = (
         A,
         transa,  # transa
@@ -284,6 +317,17 @@ def general_grouped_gemm(
             torch.empty_like(o, dtype=bias_dtype, memory_format=torch.contiguous_format)
             for o in out
         ]  # this should differ with respect to single output
+
+    if (
+        isinstance(A[0], Float8BlockwiseQTensorStorage)
+        and os.getenv("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", "0") == "1"
+        and get_device_compute_capability() >= (10, 0)
+    ):
+        assert not gelu, "GELU not supported in FP8 blockwise gemm with f32 scales."
+        assert not use_bias, "bias not supported in FP8 blockwise gemm with f32 scales."
+        # Swap A/B for cuteDSL kernels
+        blockwise_grouped_gemm_sm100(B, transb, A, transa, out, out_dtype, m_splits, accumulate)
+        return out, bias, gelu_input
 
     bias = tex.te_general_grouped_gemm(
         A,
