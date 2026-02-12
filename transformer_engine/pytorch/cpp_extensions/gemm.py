@@ -27,6 +27,34 @@ __all__ = [
 ]
 
 
+def _flatten_fp8_storage_to_2d(storage):
+    """Create a lightweight copy of Float8BlockwiseQTensorStorage with data flattened to 2D.
+
+    For rowwise data, flattens leading dimensions: (s, b, ..., k) -> (s*b*..., k).
+    For columnwise data, flattens trailing dimensions: (k, s, b, ...) -> (k, s*b*...).
+    Uses reshape (view when possible) to avoid data copies. Scales are already 2D
+    and remain unchanged.
+    """
+    new = object.__new__(Float8BlockwiseQTensorStorage)
+    new._fp8_dtype = storage._fp8_dtype
+    new._quantizer = storage._quantizer
+    new._is_2D_scaled = storage._is_2D_scaled
+    new._rowwise_scale_inv = storage._rowwise_scale_inv
+    new._columnwise_scale_inv = storage._columnwise_scale_inv
+
+    new._rowwise_data = storage._rowwise_data
+    if new._rowwise_data is not None and new._rowwise_data.ndim > 2:
+        new._rowwise_data = new._rowwise_data.reshape(-1, new._rowwise_data.shape[-1])
+
+    new._columnwise_data = storage._columnwise_data
+    if new._columnwise_data is not None and new._columnwise_data.ndim > 2:
+        new._columnwise_data = new._columnwise_data.reshape(
+            new._columnwise_data.shape[0], -1
+        )
+
+    return new
+
+
 _NUM_MAX_UB_STREAMS = 3
 
 
@@ -175,9 +203,31 @@ def general_gemm(
         and get_device_compute_capability() >= (10, 0)
     ):
         out_dtype = out_dtype or torch.bfloat16
-        # Get m, n from tensor sizes (expects 2D inputs after reshape)
-        # A: [m, k] or [k, m] depending on transa
-        # B: [k, n] or [n, k] depending on transb
+
+        # Handle 3D+ tensors: blockwise_gemm_sm100 only supports 2D inputs.
+        # Flatten leading dimensions to 2D and reshape output back afterward.
+        # Common cases:
+        #   fprop (TN): A=weight(2D), B=input(3D)  -> output 3D (*B_leading, n)
+        #   dgrad (NN): A=weight(2D), B=grad(3D)   -> output 3D (*B_leading, n)
+        #   wgrad (NT): A=input(3D),  B=grad(3D)   -> output 2D (weight shape)
+        A_orig_size = A.size()
+        B_orig_size = B.size()
+        output_leading_shape = None
+
+        if len(A_orig_size) > 2 or len(B_orig_size) > 2:
+            # Determine output 3D shape before flattening.
+            # When transb=False, m comes from B's first dim(s) which we flatten,
+            # so we need to restore B's leading dims in the output.
+            if not transb and len(B_orig_size) > 2:
+                n_out = A_orig_size[0] if transa else A_orig_size[-1]
+                output_leading_shape = tuple(B_orig_size[:-1]) + (n_out,)
+
+            if len(A_orig_size) > 2:
+                A = _flatten_fp8_storage_to_2d(A)
+            if len(B_orig_size) > 2:
+                B = _flatten_fp8_storage_to_2d(B)
+
+        # Get m, n from tensor sizes (guaranteed 2D after flattening)
         A_size = A.size()
         B_size = B.size()
         n = A_size[0] if transa else A_size[1]
@@ -187,6 +237,8 @@ def general_gemm(
                 A._rowwise_data.device if A._rowwise_data is not None else A._columnwise_data.device
             )
             out = torch.empty(m, n, device=a_device, dtype=out_dtype)
+        elif out.ndim > 2:
+            out = out.view(m, n)
         blockwise_gemm_sm100(
             B,
             transb,
@@ -198,6 +250,11 @@ def general_gemm(
             accumulate,
             torch.cuda.current_stream(),
         )
+
+        # Reshape output back to 3D if needed
+        if output_leading_shape is not None:
+            out = out.view(output_leading_shape)
+
         return out, None, None, extra_output
 
     args = (
